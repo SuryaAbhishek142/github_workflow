@@ -1,0 +1,617 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Step1 - HTTP API + 1 Lambda (no auth)
+
+Parameters:
+  EnvName: { Type: String, Default: dev }
+  WebAllowedOrigin: { Type: String, Default: "*" }
+  CodeBucket: { Type: String }
+  CodeKeyPing: { Type: String }
+  CodeKeyKV: { Type: String }
+  TableName: { Type: String }
+  CodeKeyGetItems:
+    Type: String
+  CodeKeyGetItemById:
+    Type: String
+  CodeKeyCreateItem:
+    Type: String
+  CodeKeyUpdateItem:
+    Type: String
+  CodeKeyDeleteItem:
+    Type: String
+  NetworkStackName:
+    Type: String
+    Description: Name of the network stack to import VPC/subnets from (e.g., network-dev)
+  DBInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+  DBName:
+    Type: String
+    Default: appdb
+  DBUsername:
+    Type: String
+    Default: app_user
+  CodeKeyGetItemsPg:
+    Type: String
+    Description: S3 key for get_items PG Lambda ZIP
+  CodeKeyProcessDoc:
+    Type: String
+    Description: S3 key for process_doc Lambda ZIP
+  DocBucketName:
+    Type: String
+    Default: ""
+    Description: grant Lambda s3:GetObject on this bucket for Textract S3 mode
+
+Conditions:
+  UseDocBucket: !Not [!Equals [!Ref DocBucketName, ""]]
+
+Resources:
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:                              # ← add this block
+        - PolicyName: DdbAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:DescribeTable
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt Table.Arn
+                  - !Sub '${Table.Arn}/index/*'
+              - Effect: Allow                # <— ADD THIS BLOCK
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref DbSecret
+              - Effect: Allow
+                Action:
+                  - textract:DetectDocumentText
+                  - textract:AnalyzeDocument
+                  - textract:StartDocumentTextDetection
+                  - textract:GetDocumentTextDetection
+                  - textract:StartDocumentAnalysis
+                  - textract:GetDocumentAnalysis
+                Resource: "*"   # Textract APIs require "*"
+              - !If
+                - UseDocBucket
+                - { Effect: Allow, Action: [ "s3:GetObject" ],
+                    Resource: !Sub "arn:aws:s3:::${DocBucketName}/*" }
+                - { Ref: "AWS::NoValue" }
+
+  FnKV:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: app.handler
+      Role: !GetAtt Role.Arn
+      Code: { S3Bucket: !Ref CodeBucket, S3Key: !Ref CodeKeyKV }
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref Table
+  
+  IntKV:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FnKV.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  RouteKV:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: 'POST /kv'
+      Target: !Sub integrations/${IntKV}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  PermKV:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref FnKV
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/POST/kv
+
+
+  FnPing:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: app.handler
+      Role: !GetAtt Role.Arn
+      Code: { S3Bucket: !Ref CodeBucket, S3Key: !Ref CodeKeyPing }
+      Timeout: 10
+      MemorySize: 256
+
+  Api:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub hello-${EnvName}
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: [!Ref WebAllowedOrigin]
+        AllowMethods: [GET,POST,PUT,DELETE,OPTIONS]
+        AllowHeaders: ['*']
+
+  Table:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref TableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification: { SSEEnabled: true }
+
+
+  IntPing:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FnPing.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  RoutePing:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: 'GET /ping'
+      Target: !Sub integrations/${IntPing}
+
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref Api
+      StageName: '$default'
+      AutoDeploy: true
+
+  PermPing:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref FnPing
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/GET/ping
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub demo-users-${EnvName}
+      AutoVerifiedAttributes: [email]
+      Policies: { PasswordPolicy: { MinimumLength: 12 } }
+
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [email, openid, profile]
+      CallbackURLs: ["https://example.com/callback"]  # set later for real UI
+
+  JwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref Api
+      AuthorizerType: JWT
+      Name: CognitoJwt
+      IdentitySource: ['$request.header.Authorization']
+      JwtConfiguration:
+        Audience: [!Ref UserPoolClient]
+        Issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+
+  FnGetItems:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: app.handler
+      Role: !GetAtt Role.Arn
+      Timeout: 20
+      MemorySize: 512
+      Code: { S3Bucket: !Ref CodeBucket, S3Key: !Ref CodeKeyGetItems }
+      Environment: { Variables: { TABLE_NAME: !Ref Table } }
+
+  FnGetItemById:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: app.handler
+      Role: !GetAtt Role.Arn
+      Timeout: 20
+      MemorySize: 512
+      Code: { S3Bucket: !Ref CodeBucket, S3Key: !Ref CodeKeyGetItemById }
+      Environment: { Variables: { TABLE_NAME: !Ref Table } }
+
+  FnCreateItem:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: app.handler
+      Role: !GetAtt Role.Arn
+      Timeout: 20
+      MemorySize: 512
+      Code: { S3Bucket: !Ref CodeBucket, S3Key: !Ref CodeKeyCreateItem }
+      VpcConfig:
+        SecurityGroupIds: [!Ref LambdaSecurityGroup]
+        SubnetIds:
+          - !ImportValue
+            'Fn::Sub': '${NetworkStackName}-PrivateSubnet1Id'
+          - !ImportValue
+            'Fn::Sub': '${NetworkStackName}-PrivateSubnet2Id'
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref Table
+          # NEW: Postgres connection info
+          DB_SECRET_ARN: !Ref DbSecret
+          PG_HOST: !GetAtt Postgres.Endpoint.Address
+          PG_DB: !Ref DBName
+          PG_PORT: "5432"
+
+  IntGetItems:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FnGetItems.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+  RouteGetItems:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: 'GET /items'
+      Target: !Sub integrations/${IntGetItems}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+  PermGetItems:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref FnGetItems
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/GET/items
+
+  IntGetItemById:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FnGetItemById.Arn}/invocations"
+      PayloadFormatVersion: '2.0'
+
+  RouteGetItemById:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: 'GET /items/{id}'
+      Target: !Sub integrations/${IntGetItemById}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  PermGetItemById:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref FnGetItemById
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/GET/items/*
+
+  IntCreateItem:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FnCreateItem.Arn}/invocations"
+      PayloadFormatVersion: "2.0"
+
+  RouteCreateItem:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: "POST /items"
+      Target: !Sub "integrations/${IntCreateItem}"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  PermCreateItem:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref FnCreateItem
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/POST/items"
+
+  IntUpdateItem:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FnUpdateItem.Arn}/invocations"
+      PayloadFormatVersion: "2.0"
+
+  RouteUpdateItem:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: "PUT /items/{id}"
+      Target: !Sub "integrations/${IntUpdateItem}"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  PermUpdateItem:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref FnUpdateItem
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/PUT/items/*"
+
+  IntDeleteItem:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FnDeleteItem.Arn}/invocations"
+      PayloadFormatVersion: "2.0"
+
+  RouteDeleteItem:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: "DELETE /items/{id}"
+      Target: !Sub "integrations/${IntDeleteItem}"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  PermDeleteItem:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref FnDeleteItem
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/DELETE/items/*"
+
+
+  FnUpdateItem:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: app.handler
+      Role: !GetAtt Role.Arn
+      Timeout: 20
+      MemorySize: 512
+      Code: { S3Bucket: !Ref CodeBucket, S3Key: !Ref CodeKeyUpdateItem }
+      Environment: { Variables: { TABLE_NAME: !Ref Table } }
+
+  FnDeleteItem:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: app.handler
+      Role: !GetAtt Role.Arn
+      Timeout: 20
+      MemorySize: 512
+      Code: { S3Bucket: !Ref CodeBucket, S3Key: !Ref CodeKeyDeleteItem }
+      Environment: { Variables: { TABLE_NAME: !Ref Table } }
+  
+  FnGetItemsPg:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub app-get-items-pg-${EnvName}
+      Runtime: python3.12
+      Handler: app.handler
+      Role: !GetAtt Role.Arn
+      Timeout: 20
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref CodeKeyGetItemsPg
+      VpcConfig:
+        SecurityGroupIds: [!Ref LambdaSecurityGroup]
+        SubnetIds:
+          - !ImportValue
+            'Fn::Sub': '${NetworkStackName}-PrivateSubnet1Id'
+          - !ImportValue
+            'Fn::Sub': '${NetworkStackName}-PrivateSubnet2Id'
+      Environment:
+        Variables:
+          DB_SECRET_ARN: !Ref DbSecret
+          PG_HOST: !GetAtt Postgres.Endpoint.Address
+          PG_DB: !Ref DBName
+          PG_PORT: "5432"
+          PG_TABLE: "items"
+
+  IntGetItemsPg:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FnGetItemsPg.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  RouteGetItemsPg:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: 'GET /items-pg'
+      Target: !Sub integrations/${IntGetItemsPg}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  PermGetItemsPg:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref FnGetItemsPg
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/GET/items-pg
+
+
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub /${EnvName}/rds/postgres
+      Description: RDS Postgres credentials
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"${DBUsername}","dbname":"${DBName}"}'
+        GenerateStringKey: password
+        ExcludeCharacters: "\"@/\\"
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda egress (for Step 5B when you move a function into VPC)
+      VpcId: !ImportValue
+        'Fn::Sub': '${NetworkStackName}-VpcId'
+
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow Postgres from Lambda SG
+      VpcId: !ImportValue
+        'Fn::Sub': '${NetworkStackName}-VpcId'
+
+  RdsIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RdsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for RDS
+      SubnetIds:
+        - !ImportValue
+          'Fn::Sub': '${NetworkStackName}-PrivateSubnet1Id'
+        - !ImportValue
+          'Fn::Sub': '${NetworkStackName}-PrivateSubnet2Id'
+
+  Postgres:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: postgres
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: !Ref DBAllocatedStorage
+      DBName: !Ref DBName
+      MasterUsername: !Sub "{{resolve:secretsmanager:${DbSecret}::username}}"
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DbSecret}::password}}"
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref RdsSecurityGroup]
+      MultiAZ: false         # enable true later for prod
+      StorageEncrypted: true
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 7
+
+  FnProcessDoc:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub app-process-doc-${EnvName}
+      Runtime: python3.12
+      Handler: app.handler
+      Role: !GetAtt Role.Arn
+      Timeout: 60
+      MemorySize: 1024
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref CodeKeyProcessDoc
+      Environment:
+        Variables:
+          # Optional: inform the function of a default bucket for async mode
+          DOC_BUCKET: !If [UseDocBucket, !Ref DocBucketName, ""]
+
+  IntProcessDoc:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FnProcessDoc.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  RouteProcessDocPost:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: 'POST /process-doc'
+      Target: !Sub integrations/${IntProcessDoc}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  RouteProcessDocGet:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: 'GET /process-doc/{jobId}'
+      Target: !Sub integrations/${IntProcessDoc}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  PermProcessDocPost:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref FnProcessDoc
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/POST/process-doc
+
+  PermProcessDocGet:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref FnProcessDoc
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/GET/process-doc/*
+
+Outputs:
+  ApiEndpoint:
+    Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com
+  TableName:
+    Value: !Ref Table
+  UserPoolId:
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub ${AWS::StackName}-UserPoolId
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub ${AWS::StackName}-UserPoolClientId
+  RdsEndpoint:
+    Value: !GetAtt Postgres.Endpoint.Address
+  DbSecretArn:
+    Value: !Ref DbSecret
+  ImportedVpcId:
+    Value: !ImportValue
+      'Fn::Sub': '${NetworkStackName}-VpcId'
+

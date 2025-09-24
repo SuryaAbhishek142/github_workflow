@@ -1,0 +1,115 @@
+# .github/workflows/deploy.yml
+name: Deploy via parameters file (SHA-injected keys)
+
+on:
+  push:
+    branches: [ dev, stage, main ]
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "dev|stage|prod"
+        required: true
+        default: "dev"
+
+env:
+  CFN_STACK_PREFIX: app
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    environment: ${{ inputs.env || (github.ref_name == 'main' && 'prod' || github.ref_name == 'stage' && 'stage' || 'dev') }}
+    env:
+      SELECTED_ENV: ${{ github.event.inputs.env != '' && github.event.inputs.env
+        || (github.ref_name == 'main' && 'prod'
+        || (github.ref_name == 'stage' && 'stage' || 'dev')) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: params
+        run: |
+          case "${{ env.SELECTED_ENV }}" in
+            dev)   F=infra/parameters-dev.json  ; NET=network-dev  ;;
+            stage) F=infra/parameters-stage.json; NET=network-stage;;
+            prod)  F=infra/parameters-prod.json ; NET=network-prod ;;
+            *) echo "bad env"; exit 1;;
+          esac
+          echo "param_file=$F" >> $GITHUB_OUTPUT
+          echo "stack_name=${{ env.CFN_STACK_PREFIX }}-${{ env.SELECTED_ENV }}" >> $GITHUB_OUTPUT
+          echo "network_stack=$NET" >> $GITHUB_OUTPUT
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Validate template
+        run: aws cloudformation validate-template --template-body file://infra/stack01.yaml
+
+      - name: Expand params with SHA and create build plan
+        id: expand
+        run: |
+          set -euo pipefail
+          SHA="${GITHUB_SHA}"
+          ENV="${{ env.SELECTED_ENV }}"
+          ARTIFACT_BUCKET="${{ secrets.ARTIFACT_BUCKET }}"
+
+          # Build plan TSV: NAME\tFOLDER\tS3KEY
+          : > out
+          mkdir -p out
+          : > out/plan.tsv
+
+          # Start from original params
+          cp "${{ steps.params.outputs.param_file }}" out/params-expanded.json
+
+          # For each CodeKey*, compute a new key lambda/<env>/<sha>/<name>.zip and write plan
+          while IFS=$'\t' read -r KEY VAL; do
+            BASE="$(basename "$VAL")"             # get_items.zip
+            NAME="${BASE%.zip}"                   # get_items
+            NEW="lambda/${ENV}/${SHA}/${NAME}.zip"
+            echo -e "${NAME}\tlambda/${NAME}\t${NEW}" >> out/plan.tsv
+
+            # Rewrite ParameterValue in the expanded params file
+            tmp=$(mktemp)
+            jq --arg k "$KEY" --arg v "$NEW" \
+              '(.[] | select(.ParameterKey==$k) | .ParameterValue) = $v' \
+              out/params-expanded.json > "$tmp"
+            mv "$tmp" out/params-expanded.json
+          done < <(jq -r '.[] | select(.ParameterKey|startswith("CodeKey")) | "\(.ParameterKey)\t\(.ParameterValue)"' "${{ steps.params.outputs.param_file }}")
+
+          echo "expanded_params=out/params-expanded.json" >> $GITHUB_OUTPUT
+
+      - name: Build & upload lambdas
+        run: |
+          set -euo pipefail
+          ARTIFACT_BUCKET="${{ secrets.ARTIFACT_BUCKET }}"
+          while IFS=$'\t' read -r NAME FOLDER S3KEY; do
+            echo ">> $NAME from $FOLDER -> s3://$ARTIFACT_BUCKET/$S3KEY"
+            test -d "$FOLDER" || { echo "Missing $FOLDER"; exit 1; }
+            rm -rf "$FOLDER/build" && mkdir -p "$FOLDER/build"
+            if [ -f "$FOLDER/requirements.txt" ]; then pip install -r "$FOLDER/requirements.txt" -t "$FOLDER/build"; fi
+            cp -r "$FOLDER"/*.py "$FOLDER/build/" 2>/dev/null || true
+            (cd "$FOLDER/build" && zip -r "../../../out/${NAME}.zip" .)
+            aws s3 cp "out/${NAME}.zip" "s3://${ARTIFACT_BUCKET}/${S3KEY}" --only-show-errors
+          done < out/plan.tsv
+
+      - name: Deploy CloudFormation (using expanded params)
+        run: |
+          aws cloudformation deploy \
+            --stack-name "${{ steps.params.outputs.stack_name }}" \
+            --template-file infra/stack01.yaml \
+            --parameter-overrides \
+                file://${{ steps.expand.outputs.expanded_params }} \
+                NetworkStackName=${{ steps.params.outputs.network_stack }} \
+                CodeBucket=${{ secrets.ARTIFACT_BUCKET }} \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset
+
+      - name: Outputs
+        run: |
+          aws cloudformation describe-stacks --stack-name "${{ steps.params.outputs.stack_name }}" \
+            --query "Stacks[0].Outputs" --output table

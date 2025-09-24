@@ -1,0 +1,69 @@
+[
+  {
+    "ParameterKey": "EnvName",
+    "ParameterValue": "dev"
+  },
+  {
+    "ParameterKey": "WebAllowedOrigin",
+    "ParameterValue": "*"
+  },
+  {
+    "ParameterKey": "CodeBucket",
+    "ParameterValue": "suryatest142"
+  },
+  {
+    "ParameterKey": "CodeKeyPing",
+    "ParameterValue": "lambda/dev/ping.zip"
+  }
+    ,
+    {
+        "ParameterKey": "CodeKeyKV",
+        "ParameterValue": "lambda/dev/kv.zip"
+    },
+    {
+        "ParameterKey": "TableName",
+        "ParameterValue": "MyAppKVTable" 
+    },
+    { "ParameterKey": "EnvName", "ParameterValue": "dev" },
+    {
+        "ParameterKey": "CodeKeyGetItems",
+        "ParameterValue": "lambda/dev/get_items.zip"
+    },
+    {
+        "ParameterKey": "CodeKeyPostItem",
+        "ParameterValue": "lambda/dev/post_item.zip"
+    },
+    {
+        "ParameterKey": "CodeKeyDeleteItem",
+        "ParameterValue": "lambda/dev/delete_item.zip"
+    },
+    {
+        "ParameterKey": "CodeKeyUpdateItem",
+        "ParameterValue": "lambda/dev/update_item.zip"
+    },
+    {
+        "ParameterKey": "CodeKeyGetItemById",
+        "ParameterValue": "lambda/dev/get_item_by_id.zip"
+    },
+    {
+        "ParameterKey": "CodeKeyCreateItem",
+        "ParameterValue": "lambda/dev/create_item.zip"
+    },
+    { "ParameterKey": "NetworkStackName", "ParameterValue": "network-dev" },
+    { "ParameterKey": "DBInstanceClass", "ParameterValue": "db.t4g.micro" },
+    { "ParameterKey": "DBAllocatedStorage", "ParameterValue": "20" },
+    { "ParameterKey": "DBName", "ParameterValue": "appdb" },
+    { "ParameterKey": "DBUsername", "ParameterValue": "app_user" },
+    {
+        "ParameterKey": "CodeKeyGetItemsPg",
+        "ParameterValue": "lambda/dev/get_items_pg.zip"
+    },
+    {
+        "ParameterKey": "CodeKeyProcessDoc",
+        "ParameterValue": "lambda/dev/process_doc.zip"
+    },
+    {
+        "ParameterKey": "DocBucketName",
+        "ParameterValue": "suryatest142" 
+    }
+]
