@@ -56,32 +56,40 @@ jobs:
           set -euo pipefail
           SHA="${GITHUB_SHA}"
           ENV="${{ env.SELECTED_ENV }}"
-          ARTIFACT_BUCKET="${{ secrets.ARTIFACT_BUCKET }}"
+          ARTIFACT_BUCKET="${{ secrets.ARTIFACT_BUCKET }}"  # not used here, used in upload step
 
-          # Build plan TSV: NAME\tFOLDER\tS3KEY
-          : > out
+          # fresh output dir
+          rm -rf out
           mkdir -p out
           : > out/plan.tsv
 
-          # Start from original params
+          # start from the original params for this env
           cp "${{ steps.params.outputs.param_file }}" out/params-expanded.json
 
-          # For each CodeKey*, compute a new key lambda/<env>/<sha>/<name>.zip and write plan
-          while IFS=$'\t' read -r KEY VAL; do
-            BASE="$(basename "$VAL")"             # get_items.zip
-            NAME="${BASE%.zip}"                   # get_items
-            NEW="lambda/${ENV}/${SHA}/${NAME}.zip"
-            echo -e "${NAME}\tlambda/${NAME}\t${NEW}" >> out/plan.tsv
+          # For each CodeKey* param, compute a new unique S3 key and append a build plan row
+          # Expectation: your local code folders follow "lambda/<name>"
+          # and your original ParameterValue looks like "lambda/dev/<name>.zip"
 
-            # Rewrite ParameterValue in the expanded params file
-            tmp=$(mktemp)
-            jq --arg k "$KEY" --arg v "$NEW" \
-              '(.[] | select(.ParameterKey==$k) | .ParameterValue) = $v' \
-              out/params-expanded.json > "$tmp"
-            mv "$tmp" out/params-expanded.json
-          done < <(jq -r '.[] | select(.ParameterKey|startswith("CodeKey")) | "\(.ParameterKey)\t\(.ParameterValue)"' "${{ steps.params.outputs.param_file }}")
+          jq -r '.[] | select(.ParameterKey | startswith("CodeKey")) | "\(.ParameterKey)\t\(.ParameterValue)"' \
+            "${{ steps.params.outputs.param_file }}" \
+          | while IFS=$'\t' read -r KEY VAL; do
+              BASE="$(basename "$VAL")"        # e.g., create_item.zip
+              NAME="${BASE%.zip}"              # e.g., create_item
+              NEW="lambda/${ENV}/${SHA}/${NAME}.zip"
 
-          echo "expanded_params=out/params-expanded.json" >> $GITHUB_OUTPUT
+              # write plan: NAME<TAB>FOLDER<TAB>NEW_S3_KEY
+              printf '%s\t%s\t%s\n' "$NAME" "lambda/$NAME" "$NEW" >> out/plan.tsv
+
+              # update the expanded params file in place (change the ParameterValue for KEY)
+              tmp=$(mktemp)
+              jq --arg k "$KEY" --arg v "$NEW" \
+                '(.[] | select(.ParameterKey==$k) | .ParameterValue) = $v' \
+                out/params-expanded.json > "$tmp"
+              mv "$tmp" out/params-expanded.json
+            done
+
+          # expose the expanded params path to later steps
+          echo "expanded_params=out/params-expanded.json" >> "$GITHUB_OUTPUT"
 
       - name: Build & upload lambdas
         run: |
