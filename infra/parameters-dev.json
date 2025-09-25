@@ -30,10 +30,6 @@
         "ParameterValue": "lambda/dev/get_items.zip"
     },
     {
-        "ParameterKey": "CodeKeyPostItem",
-        "ParameterValue": "lambda/dev/post_item.zip"
-    },
-    {
         "ParameterKey": "CodeKeyDeleteItem",
         "ParameterValue": "lambda/dev/delete_item.zip"
     },
