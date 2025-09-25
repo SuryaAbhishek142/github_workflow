@@ -12,7 +12,7 @@ on:
         default: "dev"
 
 env:
-  CFN_STACK_PREFIX: app
+  CFN_STACK_PREFIX: hello
 
 jobs:
   deploy:
