@@ -121,3 +121,42 @@ jobs:
         run: |
           aws cloudformation describe-stacks --stack-name "${{ steps.params.outputs.stack_name }}" \
             --query "Stacks[0].Outputs" --output table
+      
+      - name: Fetch stack outputs
+        id: cfn_out
+        run: |
+          set -euo pipefail
+          STACK="${{ steps.params.outputs.stack_name }}"
+          mkdir -p out
+
+          # 1) Get outputs as JSON
+          OUT_JSON=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK" \
+            --query 'Stacks[0].Outputs' --output json)
+          echo "$OUT_JSON" > out/stack-outputs.json
+
+          # 2) Extract common outputs (adjust keys to your template)
+          API=$(jq -r '.[] | select(.OutputKey=="ApiEndpoint") | .OutputValue' out/stack-outputs.json)
+          POOL_ID=$(jq -r '.[] | select(.OutputKey=="UserPoolId") | .OutputValue' out/stack-outputs.json)
+          CLIENT_ID=$(jq -r '.[] | select(.OutputKey=="UserPoolClientId") | .OutputValue' out/stack-outputs.json)
+
+          # 3) Expose as step outputs (usable by later steps/jobs)
+          echo "api=$API" >> "$GITHUB_OUTPUT"
+          echo "pool_id=$POOL_ID" >> "$GITHUB_OUTPUT"
+          echo "client_id=$CLIENT_ID" >> "$GITHUB_OUTPUT"
+
+          # 4) Pretty table in the job summary (Actions UI)
+          {
+            echo "### CloudFormation outputs ($STACK)"
+            echo ""
+            echo "| Key | Value |"
+            echo "|---|---|"
+            jq -r '.[] | "| \(.OutputKey) | \(.OutputValue) |"' out/stack-outputs.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload outputs as artifact (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: stack-outputs
+          path: out/stack-outputs.json
+
